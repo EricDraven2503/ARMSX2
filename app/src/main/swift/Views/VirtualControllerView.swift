@@ -1198,117 +1198,6 @@ private struct UIKitPadPressSurface<Content: View>: UIViewRepresentable {
     }
 }
 
-
-// ARMSX2_PER_BUTTON_RAW_TOUCH_DRAG_ONLY_V1
-// Diagnostic input surface for virtual buttons.
-// Goal: imitate the stick/L3/R3 "safe" path only while the finger is dragging.
-// - visual/layout geometry remains owned by PSBtn/PadBtn
-// - this view is only a transparent raw touch responder inside the existing large touchTarget frame
-// - default mode is drag-only: touch down alone does not press; press starts after a small movement threshold
-private let ARMSX2PerButtonRawTouchDragOnlyMode = true
-private let ARMSX2PerButtonRawTouchDragThreshold: CGFloat = 4
-
-@MainActor
-private struct ARMSX2PerButtonRawTouchSurface: UIViewRepresentable {
-    let onPress: (Bool) -> Void
-
-    func makeUIView(context: Context) -> ARMSX2PerButtonRawTouchUIView {
-        let view = ARMSX2PerButtonRawTouchUIView()
-        view.backgroundColor = .clear
-        view.isOpaque = false
-        view.isMultipleTouchEnabled = false
-        view.onPress = onPress
-        view.dragOnlyMode = ARMSX2PerButtonRawTouchDragOnlyMode
-        view.dragThreshold = ARMSX2PerButtonRawTouchDragThreshold
-        return view
-    }
-
-    func updateUIView(_ uiView: ARMSX2PerButtonRawTouchUIView, context: Context) {
-        uiView.onPress = onPress
-        uiView.dragOnlyMode = ARMSX2PerButtonRawTouchDragOnlyMode
-        uiView.dragThreshold = ARMSX2PerButtonRawTouchDragThreshold
-    }
-}
-
-@MainActor
-private final class ARMSX2PerButtonRawTouchUIView: UIView {
-    var onPress: (Bool) -> Void = { _ in }
-    var dragOnlyMode = true
-    var dragThreshold: CGFloat = 4
-
-    private weak var activeTouch: UITouch?
-    private var startPoint: CGPoint = .zero
-    private var isPressed = false
-
-    override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
-        // Large rectangular target only. No alpha-mask hit testing here.
-        bounds.contains(point)
-    }
-
-    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard activeTouch == nil, let touch = touches.first else {
-            return
-        }
-
-        activeTouch = touch
-        startPoint = touch.location(in: self)
-
-        if !dragOnlyMode {
-            setPressed(true)
-        }
-    }
-
-    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard let touch = activeTouch, touches.contains(touch) else {
-            return
-        }
-
-        guard dragOnlyMode, !isPressed else {
-            return
-        }
-
-        let point = touch.location(in: self)
-        let dx = point.x - startPoint.x
-        let dy = point.y - startPoint.y
-        if hypot(dx, dy) >= dragThreshold {
-            setPressed(true)
-        }
-    }
-
-    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard let touch = activeTouch, touches.contains(touch) else {
-            return
-        }
-
-        releaseActiveTouch()
-    }
-
-    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard let touch = activeTouch, touches.contains(touch) else {
-            return
-        }
-
-        releaseActiveTouch()
-    }
-
-    private func releaseActiveTouch() {
-        if isPressed {
-            setPressed(false)
-        }
-        activeTouch = nil
-        startPoint = .zero
-    }
-
-    private func setPressed(_ pressed: Bool) {
-        guard isPressed != pressed else {
-            return
-        }
-
-        isPressed = pressed
-        onPress(pressed)
-    }
-}
-
 struct PSBtn: View {
     let sym: String; let clr: Color; let sz: CGFloat; let btn: ARMSX2PadButton
     @State private var on = false
@@ -1319,16 +1208,30 @@ struct PSBtn: View {
     private var touchTarget: CGFloat { max(sz, 55) }
 
     var body: some View {
-        ZStack {
-            buttonFace
-                .frame(width: sz, height: sz)
-
-            ARMSX2PerButtonRawTouchSurface(onPress: updatePressed)
+        if ARMSX2UsesUIKitPadPressSurface() {
+            ZStack {
+                UIKitPadPressSurface(onPress: updatePressed, maskButton: btn, maskSkin: padSkin, maskVisualSize: CGSize(width: sz, height: sz)) {
+                    buttonFace
+                        .frame(width: sz, height: sz)
+                }
                 .frame(width: touchTarget, height: touchTarget)
+            }
+            .frame(width: touchTarget, height: touchTarget)
+            .opacity(padUsesFullSkin ? 1.0 : padOpacity)
+            .animation(.easeOut(duration: 0.06), value: on)
+        } else {
+            ZStack {
+                buttonFace
+                    .frame(width: sz, height: sz)
+            }
+            .frame(width: touchTarget, height: touchTarget)
+            .contentShape(Rectangle())
+            .opacity(padUsesFullSkin ? 1.0 : padOpacity)
+            .animation(.easeOut(duration: 0.06), value: on)
+            .simultaneousGesture(DragGesture(minimumDistance: 0)
+                .onChanged { _ in updatePressed(true) }
+                .onEnded { _ in updatePressed(false) })
         }
-        .frame(width: touchTarget, height: touchTarget)
-        .opacity(padUsesFullSkin ? 1.0 : padOpacity)
-        .animation(.easeOut(duration: 0.06), value: on)
     }
 
     private var buttonFace: some View {
@@ -1380,16 +1283,30 @@ struct PadBtn: View {
     private var touchH: CGFloat { max(h, 55) }
 
     var body: some View {
-        ZStack {
-            buttonFace
-                .frame(width: w, height: h)
-
-            ARMSX2PerButtonRawTouchSurface(onPress: updatePressed)
+        if ARMSX2UsesUIKitPadPressSurface() {
+            ZStack {
+                UIKitPadPressSurface(onPress: updatePressed, maskButton: btn, maskSkin: padSkin, maskVisualSize: CGSize(width: w, height: h)) {
+                    buttonFace
+                        .frame(width: w, height: h)
+                }
                 .frame(width: touchW, height: touchH)
+            }
+            .frame(width: touchW, height: touchH)
+            .opacity(padUsesFullSkin ? 1.0 : padOpacity)
+            .animation(.easeOut(duration: 0.06), value: on)
+        } else {
+            ZStack {
+                buttonFace
+                    .frame(width: w, height: h)
+            }
+            .frame(width: touchW, height: touchH)
+            .contentShape(Rectangle())
+            .opacity(padUsesFullSkin ? 1.0 : padOpacity)
+            .animation(.easeOut(duration: 0.06), value: on)
+            .simultaneousGesture(DragGesture(minimumDistance: 0)
+                .onChanged { _ in updatePressed(true) }
+                .onEnded { _ in updatePressed(false) })
         }
-        .frame(width: touchW, height: touchH)
-        .opacity(padUsesFullSkin ? 1.0 : padOpacity)
-        .animation(.easeOut(duration: 0.06), value: on)
     }
 
     private var buttonFace: some View {
