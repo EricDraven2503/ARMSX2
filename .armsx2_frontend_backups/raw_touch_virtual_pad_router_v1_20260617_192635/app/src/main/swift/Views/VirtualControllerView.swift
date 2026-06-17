@@ -48,297 +48,6 @@ enum HapticManager {
     }()
 }
 
-// MARK: - Raw virtual pad touch router
-// ARMSX2_RAW_TOUCH_VIRTUAL_PAD_ROUTER_V1
-// Experimental gameplay input path: virtual controls are rendered by SwiftUI, but all touches are
-// collected by one transparent UIKit responder. This avoids UIButton/UIControl/TapGesture paths for
-// every virtual button and mimics the stick/L3/R3 continuous-touch behaviour for the whole pad.
-@MainActor
-@Observable
-private final class ARMSX2RawVirtualPadInputState {
-    static let shared = ARMSX2RawVirtualPadInputState()
-
-    private(set) var pressedButtonRawValues: Set<Int> = []
-    private(set) var leftStickOffset: CGSize = .zero
-    private(set) var rightStickOffset: CGSize = .zero
-    private(set) var leftStickActive: Bool = false
-    private(set) var rightStickActive: Bool = false
-
-    private init() {}
-
-    func isPressed(_ button: ARMSX2PadButton) -> Bool {
-        pressedButtonRawValues.contains(Int(button.rawValue))
-    }
-
-    func stickOffset(isLeft: Bool) -> CGSize {
-        isLeft ? leftStickOffset : rightStickOffset
-    }
-
-    func isStickActive(isLeft: Bool) -> Bool {
-        isLeft ? leftStickActive : rightStickActive
-    }
-
-    func setButton(_ button: ARMSX2PadButton, pressed: Bool, hapticStyle: UIImpactFeedbackGenerator.FeedbackStyle? = .medium) {
-        let raw = Int(button.rawValue)
-        if pressed {
-            let inserted = pressedButtonRawValues.insert(raw).inserted
-            guard inserted else { return }
-            EmulatorBridge.shared.setPadButton(button, pressed: true)
-            if let hapticStyle, SettingsStore.shared.hapticFeedback {
-                switch hapticStyle {
-                case .light:
-                    HapticManager.light.impactOccurred()
-                default:
-                    HapticManager.medium.impactOccurred()
-                }
-            }
-        } else {
-            guard pressedButtonRawValues.remove(raw) != nil else { return }
-            EmulatorBridge.shared.setPadButton(button, pressed: false)
-        }
-    }
-
-    func setStick(isLeft: Bool, offset: CGSize, normalizedX: Float, normalizedY: Float) {
-        if isLeft {
-            leftStickOffset = offset
-            leftStickActive = true
-            EmulatorBridge.shared.setLeftStick(x: normalizedX, y: normalizedY)
-        } else {
-            rightStickOffset = offset
-            rightStickActive = true
-            EmulatorBridge.shared.setRightStick(x: normalizedX, y: normalizedY)
-        }
-    }
-
-    func resetStick(isLeft: Bool) {
-        if isLeft {
-            leftStickOffset = .zero
-            leftStickActive = false
-            EmulatorBridge.shared.setLeftStick(x: 0, y: 0)
-        } else {
-            rightStickOffset = .zero
-            rightStickActive = false
-            EmulatorBridge.shared.setRightStick(x: 0, y: 0)
-        }
-    }
-
-    func releaseAll() {
-        let buttons = pressedButtonRawValues
-        pressedButtonRawValues.removeAll()
-        for raw in buttons {
-            if let button = ARMSX2PadButton(rawValue: raw) {
-                EmulatorBridge.shared.setPadButton(button, pressed: false)
-            }
-        }
-        resetStick(isLeft: true)
-        resetStick(isLeft: false)
-    }
-}
-
-private enum ARMSX2RawTouchControl {
-    case button(ARMSX2PadButton)
-    case leftStick
-    case rightStick
-
-    func matches(_ other: ARMSX2RawTouchControl) -> Bool {
-        switch (self, other) {
-        case let (.button(a), .button(b)):
-            return a == b
-        case (.leftStick, .leftStick), (.rightStick, .rightStick):
-            return true
-        default:
-            return false
-        }
-    }
-}
-
-private struct ARMSX2RawTouchZone {
-    let control: ARMSX2RawTouchControl
-    let frame: CGRect
-    let stickKnobDiameter: CGFloat
-
-    init(control: ARMSX2RawTouchControl, frame: CGRect, stickKnobDiameter: CGFloat = 0) {
-        self.control = control
-        self.frame = frame
-        self.stickKnobDiameter = stickKnobDiameter
-    }
-
-    var area: CGFloat {
-        frame.width * frame.height
-    }
-}
-
-@MainActor
-private struct ARMSX2RawTouchPadRouter: UIViewRepresentable {
-    let zones: [ARMSX2RawTouchZone]
-
-    func makeUIView(context: Context) -> ARMSX2RawTouchPadRouterUIView {
-        let view = ARMSX2RawTouchPadRouterUIView()
-        view.backgroundColor = .clear
-        view.isOpaque = false
-        view.isMultipleTouchEnabled = true
-        view.zones = zones
-        return view
-    }
-
-    func updateUIView(_ uiView: ARMSX2RawTouchPadRouterUIView, context: Context) {
-        uiView.zones = zones
-    }
-}
-
-@MainActor
-private final class ARMSX2RawTouchPadRouterUIView: UIView {
-    var zones: [ARMSX2RawTouchZone] = []
-    private var activeTouches: [ObjectIdentifier: ActiveTouch] = [:]
-
-    private struct ActiveTouch {
-        var control: ARMSX2RawTouchControl
-        var hasDragged: Bool
-    }
-
-    override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
-        zone(at: point) != nil
-    }
-
-    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
-        for touch in touches {
-            let point = touch.location(in: self)
-            guard let zone = zone(at: point) else { continue }
-            let key = ObjectIdentifier(touch)
-            activeTouches[key] = ActiveTouch(control: zone.control, hasDragged: false)
-            begin(control: zone.control, at: point, in: zone, key: key)
-        }
-    }
-
-    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
-        for touch in touches {
-            let key = ObjectIdentifier(touch)
-            let point = touch.location(in: self)
-            guard var active = activeTouches[key] else {
-                if let zone = zone(at: point) {
-                    activeTouches[key] = ActiveTouch(control: zone.control, hasDragged: false)
-                    begin(control: zone.control, at: point, in: zone, key: key)
-                }
-                continue
-            }
-
-            switch active.control {
-            case .button(let oldButton):
-                let newZone = zone(at: point)
-                if let newZone, case .button(let newButton) = newZone.control {
-                    if newButton != oldButton {
-                        ARMSX2RawVirtualPadInputState.shared.setButton(oldButton, pressed: false, hapticStyle: nil)
-                        ARMSX2RawVirtualPadInputState.shared.setButton(newButton, pressed: true, hapticStyle: .medium)
-                        active.control = .button(newButton)
-                        activeTouches[key] = active
-                    }
-                } else {
-                    ARMSX2RawVirtualPadInputState.shared.setButton(oldButton, pressed: false, hapticStyle: nil)
-                    activeTouches.removeValue(forKey: key)
-                }
-
-            case .leftStick, .rightStick:
-                guard let stickZone = zone(for: active.control) else { continue }
-                updateStick(control: active.control, at: point, in: stickZone, key: key)
-            }
-        }
-    }
-
-    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
-        finish(touches)
-    }
-
-    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
-        finish(touches)
-    }
-
-    override func didMoveToWindow() {
-        super.didMoveToWindow()
-        if window == nil {
-            ARMSX2RawVirtualPadInputState.shared.releaseAll()
-            activeTouches.removeAll()
-        }
-    }
-
-    private func begin(control: ARMSX2RawTouchControl, at point: CGPoint, in zone: ARMSX2RawTouchZone, key: ObjectIdentifier) {
-        switch control {
-        case .button(let button):
-            ARMSX2RawVirtualPadInputState.shared.setButton(button, pressed: true, hapticStyle: .medium)
-        case .leftStick, .rightStick:
-            updateStick(control: control, at: point, in: zone, key: key)
-        }
-    }
-
-    private func finish(_ touches: Set<UITouch>) {
-        for touch in touches {
-            let key = ObjectIdentifier(touch)
-            guard let active = activeTouches.removeValue(forKey: key) else { continue }
-            switch active.control {
-            case .button(let button):
-                ARMSX2RawVirtualPadInputState.shared.setButton(button, pressed: false, hapticStyle: nil)
-            case .leftStick:
-                if active.hasDragged {
-                    ARMSX2RawVirtualPadInputState.shared.resetStick(isLeft: true)
-                } else {
-                    tapStickButton(.L3)
-                }
-            case .rightStick:
-                if active.hasDragged {
-                    ARMSX2RawVirtualPadInputState.shared.resetStick(isLeft: false)
-                } else {
-                    tapStickButton(.R3)
-                }
-            }
-        }
-    }
-
-    private func tapStickButton(_ button: ARMSX2PadButton) {
-        ARMSX2RawVirtualPadInputState.shared.setButton(button, pressed: true, hapticStyle: .light)
-        Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 100_000_000)
-            ARMSX2RawVirtualPadInputState.shared.setButton(button, pressed: false, hapticStyle: nil)
-        }
-    }
-
-    private func updateStick(control: ARMSX2RawTouchControl, at point: CGPoint, in zone: ARMSX2RawTouchZone, key: ObjectIdentifier) {
-        var active = activeTouches[key] ?? ActiveTouch(control: control, hasDragged: false)
-        let center = CGPoint(x: zone.frame.midX, y: zone.frame.midY)
-        let dx = point.x - center.x
-        let dy = point.y - center.y
-        let distance = hypot(dx, dy)
-        if distance > 4 {
-            active.hasDragged = true
-        }
-        activeTouches[key] = active
-
-        guard active.hasDragged else { return }
-
-        let maxRadius = max(1, (min(zone.frame.width, zone.frame.height) - zone.stickKnobDiameter) / 2)
-        let clampedDistance = min(distance, maxRadius)
-        let angle = atan2(dy, dx)
-        let offset = CGSize(width: cos(angle) * clampedDistance, height: sin(angle) * clampedDistance)
-        let nx = Float(offset.width / maxRadius)
-        let ny = Float(offset.height / maxRadius)
-        ARMSX2RawVirtualPadInputState.shared.setStick(isLeft: isLeftStick(control), offset: offset, normalizedX: nx, normalizedY: ny)
-    }
-
-    private func zone(at point: CGPoint) -> ARMSX2RawTouchZone? {
-        zones
-            .filter { $0.frame.contains(point) }
-            .min { $0.area < $1.area }
-    }
-
-    private func zone(for control: ARMSX2RawTouchControl) -> ARMSX2RawTouchZone? {
-        zones.first { $0.control.matches(control) }
-    }
-
-    private func isLeftStick(_ control: ARMSX2RawTouchControl) -> Bool {
-        if case .leftStick = control { return true }
-        return false
-    }
-}
-
-
 enum ControllerAsset {
     private static let edgeToEdgePortraitAspectRatio: CGFloat = 1.55
 
@@ -882,85 +591,6 @@ struct VirtualControllerView: View {
         layout.perButtonPosition(for: id, landscape: landscape, areaW: w, areaH: h)
     }
 
-    // ARMSX2_RAW_TOUCH_ZONES_V1
-    // Build large rectangular input zones from the selected layout/custom layout.
-    // The alpha mask remains visual-only; this table controls input.
-    private func rawTouchZones(w: CGFloat, h: CGFloat, landscape: Bool) -> [ARMSX2RawTouchZone] {
-        var zones: [ARMSX2RawTouchZone] = []
-
-        func buttonFrame(centerX: CGFloat, centerY: CGFloat, width: CGFloat, height: CGFloat, scale: CGFloat) -> CGRect {
-            let scaledW = max(width, 55) * scale
-            let scaledH = max(height, 55) * scale
-            return CGRect(x: centerX - scaledW / 2, y: centerY - scaledH / 2, width: scaledW, height: scaledH)
-        }
-
-        func addButton(_ button: ARMSX2PadButton, centerX: CGFloat, centerY: CGFloat, width: CGFloat, height: CGFloat, scale: CGFloat) {
-            zones.append(ARMSX2RawTouchZone(control: .button(button), frame: buttonFrame(centerX: centerX, centerY: centerY, width: width, height: height, scale: scale)))
-        }
-
-        if layout.isControlVisible("dpad") {
-            let dpadW = VirtualPadButtonOffset.dpadButtonWidth(isLandscape: landscape)
-            let entries: [(String, ARMSX2PadButton)] = [
-                ("up", .up),
-                ("down", .down),
-                ("left", .left),
-                ("right", .right)
-            ]
-            for (id, button) in entries {
-                let p = perButtonPos(id, landscape: landscape, w: w, h: h)
-                addButton(button, centerX: p.x * w, centerY: p.y * h, width: dpadW, height: dpadW, scale: p.scale)
-            }
-        }
-
-        let actionSz = VirtualPadButtonOffset.actionButtonSize
-        let actionEntries: [(String, ARMSX2PadButton)] = [
-            ("triangle", .triangle),
-            ("cross", .cross),
-            ("square", .square),
-            ("circle", .circle)
-        ]
-        for (id, button) in actionEntries where layout.isControlVisible(id) {
-            let p = perButtonPos(id, landscape: landscape, w: w, h: h)
-            addButton(button, centerX: p.x * w, centerY: p.y * h, width: actionSz, height: actionSz, scale: p.scale)
-        }
-
-        let shoulderEntries: [(String, ARMSX2PadButton, CGFloat, CGFloat)] = landscape ? [
-            ("l2", .L2, 130, 44),
-            ("l1", .L1, 120, 32),
-            ("r2", .R2, 130, 44),
-            ("r1", .R1, 120, 32),
-            ("select", .select, 40, 22),
-            ("start", .start, 48, 22)
-        ] : [
-            ("l2", .L2, 110, 40),
-            ("l1", .L1, 100, 30),
-            ("r2", .R2, 110, 40),
-            ("r1", .R1, 100, 30),
-            ("select", .select, 42, 22),
-            ("start", .start, 48, 22)
-        ]
-        for (id, button, bw, bh) in shoulderEntries where layout.isControlVisible(id) {
-            let p = pos(id, landscape: landscape)
-            addButton(button, centerX: p.x * w, centerY: p.y * h, width: bw, height: bh, scale: p.scale)
-        }
-
-        let stickBase = 68 * analogStickScale
-        let stickKnob = 30 * analogStickScale
-        if layout.isControlVisible("lstick") {
-            let p = pos("lstick", landscape: landscape)
-            let size = max(stickBase, 55) * p.scale
-            zones.append(ARMSX2RawTouchZone(control: .leftStick, frame: CGRect(x: p.x * w - size / 2, y: p.y * h - size / 2, width: size, height: size), stickKnobDiameter: stickKnob * p.scale))
-        }
-        if layout.isControlVisible("rstick") {
-            let p = pos("rstick", landscape: landscape)
-            let size = max(stickBase, 55) * p.scale
-            zones.append(ARMSX2RawTouchZone(control: .rightStick, frame: CGRect(x: p.x * w - size / 2, y: p.y * h - size / 2, width: size, height: size), stickKnobDiameter: stickKnob * p.scale))
-        }
-
-        return zones
-    }
-
-
     // MARK: - Landscape: overlay on game screen
     @ViewBuilder
     func landscapeLayout(w: CGFloat, h: CGFloat) -> some View {
@@ -1057,10 +687,6 @@ struct VirtualControllerView: View {
                     .scaleEffect(pos("rstick", landscape: true).scale)
                     .position(x: pos("rstick", landscape: true).x * w, y: pos("rstick", landscape: true).y * h)
             }
-
-            // ARMSX2_RAW_TOUCH_ROUTER_OVERLAY_LANDSCAPE_V1
-            ARMSX2RawTouchPadRouter(zones: rawTouchZones(w: w, h: h, landscape: true))
-                .frame(width: w, height: h)
         }
     }
 
@@ -1165,10 +791,6 @@ struct VirtualControllerView: View {
                         .scaleEffect(pos("rstick", landscape: false).scale)
                         .position(x: pos("rstick", landscape: false).x * cW, y: pos("rstick", landscape: false).y * cH)
                 }
-
-                // ARMSX2_RAW_TOUCH_ROUTER_OVERLAY_PORTRAIT_V1
-                ARMSX2RawTouchPadRouter(zones: rawTouchZones(w: cW, h: cH, landscape: false))
-                    .frame(width: cW, height: cH)
             }
         }
     }
@@ -1578,98 +1200,153 @@ private struct UIKitPadPressSurface<Content: View>: UIViewRepresentable {
 
 struct PSBtn: View {
     let sym: String; let clr: Color; let sz: CGFloat; let btn: ARMSX2PadButton
-    @State private var rawInput = ARMSX2RawVirtualPadInputState.shared
+    @State private var on = false
     @Environment(\.padOpacity) private var padOpacity
     @Environment(\.padSkin) private var padSkin
     @Environment(\.padUsesFullSkin) private var padUsesFullSkin
 
     private var touchTarget: CGFloat { max(sz, 55) }
-    private var on: Bool { rawInput.isPressed(btn) }
 
     var body: some View {
-        buttonFace
-            .frame(width: sz, height: sz)
+        if ARMSX2UsesUIKitPadPressSurface() {
+            ZStack {
+                UIKitPadPressSurface(onPress: updatePressed, maskButton: btn, maskSkin: padSkin, maskVisualSize: CGSize(width: sz, height: sz)) {
+                    buttonFace
+                        .frame(width: sz, height: sz)
+                }
+                .frame(width: touchTarget, height: touchTarget)
+            }
             .frame(width: touchTarget, height: touchTarget)
             .opacity(padUsesFullSkin ? 1.0 : padOpacity)
             .animation(.easeOut(duration: 0.06), value: on)
-            .allowsHitTesting(false)
+        } else {
+            ZStack {
+                buttonFace
+                    .frame(width: sz, height: sz)
+            }
+            .frame(width: touchTarget, height: touchTarget)
+            .contentShape(Rectangle())
+            .opacity(padUsesFullSkin ? 1.0 : padOpacity)
+            .animation(.easeOut(duration: 0.06), value: on)
+            .simultaneousGesture(DragGesture(minimumDistance: 0)
+                .onChanged { _ in updatePressed(true) }
+                .onEnded { _ in updatePressed(false) })
+        }
     }
 
     private var buttonFace: some View {
-        let pressed = on
-        return ZStack {
+        ZStack {
             Circle()
                 .fill(.clear)
 
-            if !padUsesFullSkin || pressed {
-                ControllerPressEffect(shape: Circle(), color: clr, isPressed: pressed, opacity: padUsesFullSkin ? padOpacity * 0.75 : padOpacity)
+            if !padUsesFullSkin || on {
+                ARMSX2SkinMaskPressEffect(button: btn, skin: padSkin, color: clr, isPressed: on, opacity: padUsesFullSkin ? padOpacity * 0.75 : padOpacity)
             }
 
             if !padUsesFullSkin {
                 ControllerAssetImage(
                     fileName: ControllerAsset.fileName(for: btn),
                     fallback: sym,
-                    fallbackColor: pressed ? .white : clr,
+                    fallbackColor: on ? .white : clr,
                     fallbackFontSize: sz * 0.42,
                     skin: padSkin
                 )
                     .padding(padSkin == .crispVector ? 0 : max(1, sz * 0.03))
-                    .brightness(pressed ? 0.18 : 0)
-                    .saturation(pressed ? 1.16 : 1.0)
-                    .scaleEffect(pressed ? 0.90 : 1.0)
+                    .brightness(on ? 0.18 : 0)
+                    .saturation(on ? 1.16 : 1.0)
+                    .scaleEffect(on ? 0.90 : 1.0)
             }
+        }
+    }
+
+    private func updatePressed(_ pressed: Bool) {
+        guard on != pressed else {
+            return
+        }
+
+        on = pressed
+        EmulatorBridge.shared.setPadButton(btn, pressed: pressed)
+        if pressed && SettingsStore.shared.hapticFeedback {
+            HapticManager.medium.impactOccurred()
         }
     }
 }
 
 struct PadBtn: View {
     let label: String; let w: CGFloat; let h: CGFloat; let btn: ARMSX2PadButton
-    @State private var rawInput = ARMSX2RawVirtualPadInputState.shared
+    @State private var on = false
     @Environment(\.padOpacity) private var padOpacity
     @Environment(\.padSkin) private var padSkin
     @Environment(\.padUsesFullSkin) private var padUsesFullSkin
 
     private var touchW: CGFloat { max(w, 55) }
     private var touchH: CGFloat { max(h, 55) }
-    private var on: Bool { rawInput.isPressed(btn) }
 
     var body: some View {
-        buttonFace
-            .frame(width: w, height: h)
+        if ARMSX2UsesUIKitPadPressSurface() {
+            ZStack {
+                UIKitPadPressSurface(onPress: updatePressed, maskButton: btn, maskSkin: padSkin, maskVisualSize: CGSize(width: w, height: h)) {
+                    buttonFace
+                        .frame(width: w, height: h)
+                }
+                .frame(width: touchW, height: touchH)
+            }
             .frame(width: touchW, height: touchH)
             .opacity(padUsesFullSkin ? 1.0 : padOpacity)
             .animation(.easeOut(duration: 0.06), value: on)
-            .allowsHitTesting(false)
+        } else {
+            ZStack {
+                buttonFace
+                    .frame(width: w, height: h)
+            }
+            .frame(width: touchW, height: touchH)
+            .contentShape(Rectangle())
+            .opacity(padUsesFullSkin ? 1.0 : padOpacity)
+            .animation(.easeOut(duration: 0.06), value: on)
+            .simultaneousGesture(DragGesture(minimumDistance: 0)
+                .onChanged { _ in updatePressed(true) }
+                .onEnded { _ in updatePressed(false) })
+        }
     }
 
     private var buttonFace: some View {
-        let pressed = on
         let shape = RoundedRectangle(cornerRadius: min(w, h) * 0.28, style: .continuous)
         return ZStack {
             shape
                 .fill(.clear)
 
-            if !padUsesFullSkin || pressed {
-                ControllerPressEffect(shape: shape, color: .white, isPressed: pressed, opacity: padUsesFullSkin ? padOpacity * 0.75 : padOpacity)
+            if !padUsesFullSkin || on {
+                ARMSX2SkinMaskPressEffect(button: btn, skin: padSkin, color: .white, isPressed: on, opacity: padUsesFullSkin ? padOpacity * 0.75 : padOpacity)
             }
 
             if !padUsesFullSkin {
                 ControllerAssetImage(
                     fileName: ControllerAsset.fileName(for: btn),
                     fallback: label,
-                    fallbackColor: pressed ? .black : .white,
+                    fallbackColor: on ? .black : .white,
                     fallbackFontSize: min(w, h) * 0.38,
                     skin: padSkin
                 )
                     .padding(padSkin == .crispVector ? 0 : max(1, min(w, h) * 0.03))
-                    .brightness(pressed ? 0.18 : 0)
-                    .scaleEffect(pressed ? 0.91 : 1.0)
+                    .brightness(on ? 0.18 : 0)
+                    .scaleEffect(on ? 0.91 : 1.0)
             }
+        }
+    }
+
+    private func updatePressed(_ pressed: Bool) {
+        guard on != pressed else {
+            return
+        }
+
+        on = pressed
+        EmulatorBridge.shared.setPadButton(btn, pressed: pressed)
+        if pressed && SettingsStore.shared.hapticFeedback {
+            HapticManager.medium.impactOccurred()
         }
     }
 }
 
-// MARK: - Analog Stick with L3/R3 tap
 // MARK: - Analog Stick with L3/R3 tap
 struct StickView: View {
     let isLeft: Bool
@@ -1685,22 +1362,11 @@ struct StickView: View {
         30 * clampedScale
     }
 
-    @State private var rawInput = ARMSX2RawVirtualPadInputState.shared
+    @State private var off: CGSize = .zero
+    @State private var isDragging = false
     @Environment(\.padOpacity) private var padOpacity
     @Environment(\.padSkin) private var padSkin
     @Environment(\.padUsesFullSkin) private var padUsesFullSkin
-
-    private var off: CGSize {
-        rawInput.stickOffset(isLeft: isLeft)
-    }
-
-    private var isDragging: Bool {
-        rawInput.isStickActive(isLeft: isLeft)
-    }
-
-    private var stickButtonPressed: Bool {
-        rawInput.isPressed(isLeft ? .L3 : .R3)
-    }
 
     var body: some View {
         ZStack {
@@ -1708,11 +1374,11 @@ struct StickView: View {
                 .fill(.clear)
                 .frame(width: sz, height: sz)
 
-            if isDragging || stickButtonPressed {
+            if isDragging {
                 Circle()
-                    .fill(.black.opacity(((isDragging || stickButtonPressed) ? 0.26 : 0.18) * padOpacity))
-                    .stroke(.white.opacity(((isDragging || stickButtonPressed) ? 0.34 : 0.18) * padOpacity), lineWidth: (isDragging || stickButtonPressed) ? 1.8 : 1)
-                    .shadow(color: .white.opacity((isDragging || stickButtonPressed) ? 0.22 * padOpacity : 0.05 * padOpacity), radius: (isDragging || stickButtonPressed) ? 8 : 2)
+                    .fill(.black.opacity((isDragging ? 0.26 : 0.18) * padOpacity))
+                    .stroke(.white.opacity((isDragging ? 0.34 : 0.18) * padOpacity), lineWidth: isDragging ? 1.8 : 1)
+                    .shadow(color: .white.opacity(isDragging ? 0.22 * padOpacity : 0.05 * padOpacity), radius: isDragging ? 8 : 2)
                     .frame(width: sz, height: sz)
             }
 
@@ -1735,20 +1401,20 @@ struct StickView: View {
                 )
                     .frame(width: knob, height: knob)
                     .opacity(padOpacity)
-                    .brightness((isDragging || stickButtonPressed) ? 0.18 : 0)
-                    .scaleEffect((isDragging || stickButtonPressed) ? 1.08 : 1.0)
+                    .brightness(isDragging ? 0.18 : 0)
+                    .scaleEffect(isDragging ? 1.08 : 1.0)
                     .offset(off)
                 ControllerAssetImage(
                     fileName: isLeft ? "ic_controller_l3_button.png" : "ic_controller_r3_button.png",
                     fallback: isLeft ? "L3" : "R3",
-                    fallbackColor: .white.opacity(stickButtonPressed ? 0.75 : 0.35),
+                    fallbackColor: .white.opacity(0.35),
                     fallbackFontSize: 9,
                     skin: padSkin
                 )
                     .frame(width: 18, height: 18)
-                    .opacity((stickButtonPressed ? 0.75 : 0.45) * padOpacity)
+                    .opacity(0.45 * padOpacity)
                     .offset(y: sz / 2 + 9)
-            } else if isDragging || stickButtonPressed {
+            } else if isDragging {
                 Circle()
                     .fill(.white.opacity(0.22 * padOpacity))
                     .stroke(.white.opacity(0.34 * padOpacity), lineWidth: 1.4)
@@ -1757,6 +1423,38 @@ struct StickView: View {
             }
         }
         .contentShape(Circle())
-        .allowsHitTesting(false)
+        .simultaneousGesture(DragGesture(minimumDistance: 0)
+            .onChanged { v in
+                let maxR = (sz - knob) / 2
+                let dist = hypot(v.translation.width, v.translation.height)
+                if dist > 4 {
+                    isDragging = true
+                    let d = min(dist, maxR)
+                    let a = atan2(v.translation.height, v.translation.width)
+                    off = CGSize(width: cos(a) * d, height: sin(a) * d)
+                    let nx = Float(cos(a) * d / maxR); let ny = Float(sin(a) * d / maxR)
+                    isLeft ? EmulatorBridge.shared.setLeftStick(x: nx, y: ny)
+                           : EmulatorBridge.shared.setRightStick(x: nx, y: ny)
+                }
+            }
+            .onEnded { _ in
+                if !isDragging {
+                    // Tap (no significant drag) → L3/R3 press
+                    let btn: ARMSX2PadButton = isLeft ? .L3 : .R3
+                    EmulatorBridge.shared.setPadButton(btn, pressed: true)
+                    if SettingsStore.shared.hapticFeedback {
+                        HapticManager.light.impactOccurred()
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        EmulatorBridge.shared.setPadButton(btn, pressed: false)
+                    }
+                } else {
+                    // Drag ended → reset stick
+                    withAnimation(.spring(duration: 0.12)) { off = .zero }
+                    isLeft ? EmulatorBridge.shared.setLeftStick(x: 0, y: 0)
+                           : EmulatorBridge.shared.setRightStick(x: 0, y: 0)
+                }
+                isDragging = false
+            })
     }
 }
